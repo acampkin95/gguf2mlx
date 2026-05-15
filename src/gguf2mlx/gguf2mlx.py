@@ -10,7 +10,6 @@ Phase 1: Real weight extraction, safetensors output, architecture detection,
 import argparse
 import gc
 import json
-import os
 import sys
 import warnings
 from pathlib import Path
@@ -20,16 +19,8 @@ from tqdm import tqdm
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Optional imports with friendly error messages
+# Required imports with friendly error messages
 # ---------------------------------------------------------------------------
-
-try:
-    import mlx.core as mx
-
-    MLX_AVAILABLE = True
-except ImportError:
-    MLX_AVAILABLE = False
-    # We can still convert without MLX (just won't verify)
 
 try:
     from gguf import GGUFReader
@@ -497,7 +488,7 @@ def extract_tokenizer(reader: GGUFReader, output_dir: Path) -> None:
         "<|im_end|>", "</s>", "<|end_of_text|>", "<|eot_id|>", "<|end|>",
     ]
 
-    if tokens and (bos_id in (None, 0, 1, 2, 3)):
+    if tokens and (bos_id in (0, 1, 2, 3)):
         found = False
         for candidate in SPECIAL_BOS_CANDIDATES:
             if candidate in tokens:
@@ -517,7 +508,7 @@ def extract_tokenizer(reader: GGUFReader, output_dir: Path) -> None:
                 if found:
                     break
 
-    if tokens and (eos_id in (None, 0, 1, 2, 3)):
+    if tokens and (eos_id in (0, 1, 2, 3)):
         found = False
         for candidate in SPECIAL_EOS_CANDIDATES:
             if candidate in tokens:
@@ -1049,6 +1040,10 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # Auto-derive output directory from input filename if not specified
+    if args.output is None:
+        args.output = Path(args.input).stem + "-mlx"
 
     if args.skip_weights:
         # Just dump info
