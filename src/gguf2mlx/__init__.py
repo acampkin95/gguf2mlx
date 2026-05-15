@@ -5,6 +5,6 @@ for optimized inference on Apple Silicon devices.
 
 __version__ = "2.0.1"
 
-from .gguf2mlx import convert, detect_architecture, build_config, extract_tokenizer
+from .gguf2mlx import convert, detect_architecture, build_config, extract_tokenizer, main
 
-__all__ = ["convert", "detect_architecture", "build_config", "extract_tokenizer"]
+__all__ = ["convert", "detect_architecture", "build_config", "extract_tokenizer", "main"]

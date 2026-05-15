@@ -47,9 +47,9 @@ One command. Full conversion. Ready for `mlx_lm.load()`.
 ### Install
 
 ```bash
-pip install gguf2mlx
+pip install git+https://github.com/barrontang/gguf2mlx.git
 # or
-uv add gguf2mlx
+uv add git+https://github.com/barrontang/gguf2mlx.git
 ```
 
 ### Convert
