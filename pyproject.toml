@@ -1,6 +1,6 @@
 [project]
 name = "gguf2mlx"
-version = "2.0.1"
+version = "2.0.2"
 description = "Convert GGUF models to MLX (Apple Silicon) safetensors format"
 readme = "README.md"
 requires-python = ">=3.10"
