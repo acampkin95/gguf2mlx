@@ -11,7 +11,6 @@ import argparse
 import gc
 import json
 import os
-import gc
 import sys
 import warnings
 from pathlib import Path
