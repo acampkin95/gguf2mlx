@@ -67,8 +67,12 @@ def get_metadata_int(reader: GGUFReader, key: str) -> Optional[int]:
     val = field.contents()
     if val is None:
         return None
+    # Handle numpy arrays
     if isinstance(val, np.ndarray):
         return int(val.flat[0]) if val.size > 0 else None
+    # Handle Python lists/tuples (some GGUF fields return these, e.g., Gemma4 head_count_kv)
+    if isinstance(val, (list, tuple)):
+        return int(val[0]) if len(val) > 0 else None
     return int(val)
 
 
@@ -80,8 +84,12 @@ def get_metadata_float(reader: GGUFReader, key: str) -> Optional[float]:
     val = field.contents()
     if val is None:
         return None
+    # Handle numpy arrays
     if isinstance(val, np.ndarray):
         return float(val.flat[0]) if val.size > 0 else None
+    # Handle Python lists/tuples
+    if isinstance(val, (list, tuple)):
+        return float(val[0]) if len(val) > 0 else None
     return float(val)
 
 
