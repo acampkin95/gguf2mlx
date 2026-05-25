@@ -367,19 +367,55 @@ def build_config(reader: GGUFReader, arch: str) -> dict[str, Any]:
         num_experts_per_tok = get_metadata_int(reader, f"{arch}.expert_used_count") or 2
         moe_ffn_size = get_metadata_int(reader, f"{arch}.expert_feed_forward_length") or ffn_size
         
+        # Head dimension from key_length
+        head_dim = get_metadata_int(reader, f"{arch}.attention.key_length") or (hidden_size // num_heads)
+        rope_dim = get_metadata_int(reader, f"{arch}.rope.dimension_count") or head_dim
+        sliding_window = get_metadata_int(reader, f"{arch}.attention.sliding_window") or 0
+        sliding_window_pattern = get_metadata_int(reader, f"{arch}.attention.sliding_window_pattern") or 4
+        rope_freq_base = get_metadata_float(reader, f"{arch}.rope.freq_base") or 10000.0
+        shared_kv_layers = get_metadata_int(reader, f"{arch}.attention.shared_kv_layers") or 0
+        final_logit_softcapping = get_metadata_float(reader, f"{arch}.final_logit_softcapping") or 0.0
+        
         config["enable_moe_block"] = True
         config["num_experts"] = num_experts
         config["num_experts_per_tok"] = num_experts_per_tok
         config["top_k_experts"] = num_experts_per_tok
+        config["moe_intermediate_size"] = moe_ffn_size
         config["hidden_size_per_layer_input"] = 0  # Gemma4 doesn't use per-layer input
-        config["layer_types"] = None  # Auto-detected by mlx_lm
         
-        # Gemma4-specific rope params
+        # Head dimension config
+        config["head_dim"] = head_dim
+        config["global_head_dim"] = head_dim
+        config["attention_k_eq_v"] = False
+        
+        # Layer types (sliding window pattern)
+        config["sliding_window"] = sliding_window
+        config["sliding_window_pattern"] = sliding_window_pattern
+        config["num_kv_shared_layers"] = shared_kv_layers
+        config["num_global_key_value_heads"] = num_kv_heads  # Default, may vary per layer
+        
+        # Rope config - use format expected by Llama3RoPE
         config["rope_traditional"] = False
+        config["partial_rotary_factor"] = 0.5
+        config["global_partial_rotary_factor"] = 0.5
+        # Note: rope_parameters format must be compatible with mlx_lm's Llama3RoPE
+        # which expects: factor, low_freq_factor, high_freq_factor, original_max_position_embeddings
         config["rope_parameters"] = {
-            "sliding_attention": {"factor": 4, "low_freq_factor": 0.5},
-            "full_attention": {"factor": 1, "low_freq_factor": 0},
+            "factor": 4,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 4096,
         }
+        
+        # Other Gemma4-specific config
+        config["final_logit_softcapping"] = final_logit_softcapping
+        config["use_double_wide_mlp"] = False  # Gemma4 uses standard MLP
+        config["tie_word_embeddings"] = False
+        config["pad_token_id"] = 0
+        config["vocab_size_per_layer_input"] = 0
+        
+        # Model type for Gemma4
+        config["model_type"] = "gemma4"
 
     return config
 
@@ -393,19 +429,25 @@ def _map_gemma4_tensor_name(gguf_name: str) -> str:
     """Map a Gemma4-architecture GGUF tensor name to MLX format.
     
     Gemma4 uses MoE (Mixture of Experts) with different tensor naming than Llama.
-    mlx_lm expects specific tensor names for Gemma4.
+    mlx_lm's gemma4_text.Model expects weights WITHOUT language_model prefix:
+    - model.layers.X.xxx
+    - model.embed_tokens.weight
+    - lm_head.weight
+    - model.norm.weight
+    
+    The outer gemma4.Model.sanitize() will add/remove language_model. prefix.
     """
     # Embedding
     if gguf_name == "token_embd.weight":
-        return "embed_tokens.weight"
+        return "model.embed_tokens.weight"
 
     # Output
     if gguf_name == "output.weight":
         return "lm_head.weight"
     if gguf_name == "output_norm.weight":
-        return "norm.weight"
+        return "model.norm.weight"
 
-    # Blocks: blk.N.xxx → layers.N.xxx
+    # Blocks: blk.N.xxx → model.layers.N.xxx
     if gguf_name.startswith("blk."):
         parts = gguf_name.split(".", 2)
         if len(parts) < 3:
@@ -415,68 +457,77 @@ def _map_gemma4_tensor_name(gguf_name: str) -> str:
 
         # === Gemma4 Attention ===
         if rest == "attn_q.weight":
-            return f"layers.{layer_idx}.self_attn.q_proj.weight"
+            return f"model.layers.{layer_idx}.self_attn.q_proj.weight"
         if rest == "attn_k.weight":
-            return f"layers.{layer_idx}.self_attn.k_proj.weight"
+            return f"model.layers.{layer_idx}.self_attn.k_proj.weight"
         if rest == "attn_v.weight":
-            return f"layers.{layer_idx}.self_attn.v_proj.weight"
+            return f"model.layers.{layer_idx}.self_attn.v_proj.weight"
         if rest == "attn_output.weight":
-            return f"layers.{layer_idx}.self_attn.o_proj.weight"
+            return f"model.layers.{layer_idx}.self_attn.o_proj.weight"
         if rest == "attn_q_norm.weight":
-            return f"layers.{layer_idx}.self_attn.q_norm.weight"
+            return f"model.layers.{layer_idx}.self_attn.q_norm.weight"
         if rest == "attn_k_norm.weight":
-            return f"layers.{layer_idx}.self_attn.k_norm.weight"
+            return f"model.layers.{layer_idx}.self_attn.k_norm.weight"
 
         # === Gemma4 Layer Norms ===
         if rest == "attn_norm.weight":
-            return f"layers.{layer_idx}.input_layernorm.weight"
+            return f"model.layers.{layer_idx}.input_layernorm.weight"
         if rest == "attn_norm_2.weight":
-            return f"layers.{layer_idx}.input_layernorm.weight"
+            return f"model.layers.{layer_idx}.input_layernorm.weight"
         if rest == "post_attention_norm.weight":
-            return f"layers.{layer_idx}.input_layernorm.weight"
+            return f"model.layers.{layer_idx}.input_layernorm.weight"
         if rest == "post_attention_norm_1.weight":
-            return f"layers.{layer_idx}.input_layernorm.weight"
+            return f"model.layers.{layer_idx}.input_layernorm.weight"
         if rest == "ffn_norm.weight":
-            return f"layers.{layer_idx}.post_attention_layernorm.weight"
+            return f"model.layers.{layer_idx}.post_attention_layernorm.weight"
         if rest == "post_ffw_norm.weight":
-            return f"layers.{layer_idx}.post_attention_layernorm.weight"
+            return f"model.layers.{layer_idx}.post_attention_layernorm.weight"
         if rest == "post_ffw_norm_1.weight":
-            return f"layers.{layer_idx}.post_feedforward_layernorm_1.weight"
+            return f"model.layers.{layer_idx}.post_feedforward_layernorm_1.weight"
         if rest == "post_ffw_norm_2.weight":
-            return f"layers.{layer_idx}.post_feedforward_layernorm_2.weight"
+            return f"model.layers.{layer_idx}.post_feedforward_layernorm_2.weight"
         if rest == "pre_ffw_norm_2.weight":
-            return f"layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
+            return f"model.layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
 
         # === Gemma4 MoE FFN (Standard MLP) ===
         if rest == "ffn_gate.weight":
-            return f"layers.{layer_idx}.mlp.gate_proj.weight"
+            return f"model.layers.{layer_idx}.mlp.gate_proj.weight"
         if rest == "ffn_up.weight":
-            return f"layers.{layer_idx}.mlp.up_proj.weight"
+            return f"model.layers.{layer_idx}.mlp.up_proj.weight"
         if rest == "ffn_down.weight":
-            return f"layers.{layer_idx}.mlp.down_proj.weight"
+            return f"model.layers.{layer_idx}.mlp.down_proj.weight"
+
+        # === Gemma4 MoE FFN Layernorms ===
+        if rest == "pre_feedforward_layernorm.weight":
+            return f"model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
+        if rest == "post_feedforward_layernorm.weight":
+            return f"model.layers.{layer_idx}.post_feedforward_layernorm.weight"
 
         # === Gemma4 MoE Router ===
-        # mlx_lm uses router.proj.weight
+        # mlx_lm uses router.proj.weight, router.scale, router.per_expert_scale
         if rest == "ffn_gate_inp.weight":
-            return f"layers.{layer_idx}.router.proj.weight"
-        if rest.startswith("ffn_gate_inp"):
-            return None  # Skip scale tensors
+            return f"model.layers.{layer_idx}.router.proj.weight"
 
         # === Gemma4 MoE Experts (SwitchGLU) ===
-        # mlx_lm uses experts.switch_glu.gate_proj/up_proj/down_proj
+        # mlx_lm sanitize() expects experts.gate_up_proj/down_proj
+        # (will be split/renamed internally to switch_glu.xxx)
         if rest == "ffn_gate_up_exps.weight":
-            return f"layers.{layer_idx}.experts.switch_glu.gate_proj.weight"
+            return f"model.layers.{layer_idx}.experts.gate_up_proj.weight"
         if rest == "ffn_gate_exps.weight":
-            return f"layers.{layer_idx}.experts.switch_glu.gate_proj.weight"
+            return f"model.layers.{layer_idx}.experts.gate_up_proj.weight"
         if rest == "ffn_up_exps.weight":
-            return f"layers.{layer_idx}.experts.switch_glu.up_proj.weight"
+            return None  # Skip - merged into gate_up_proj by mlx_lm sanitize
         if rest == "ffn_down_exps.weight":
-            return f"layers.{layer_idx}.experts.switch_glu.down_proj.weight"
+            return f"model.layers.{layer_idx}.experts.down_proj.weight"
+
+        # === Gemma4 Layer Scalar ===
+        if rest == "layer_scalar" or rest.endswith(".layer_scalar"):
+            return f"model.layers.{layer_idx}.layer_scalar"
 
         # === Skip scale factors ===
-        if any(rest.startswith(x) for x in [
+        if any(rest.startswith(x) or rest == x for x in [
             "ffn_down_exps.scale", "ffn_up_exps.scale", "ffn_gate_exps.scale",
-            "layer_output_scale", "ffn_gate_inp.scale"
+            "layer_output_scale", "layer_output_scale.weight", "ffn_gate_inp.scale"
         ]):
             return None
 
