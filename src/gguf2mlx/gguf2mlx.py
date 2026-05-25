@@ -360,12 +360,131 @@ def build_config(reader: GGUFReader, arch: str) -> dict[str, Any]:
             config["output_router_logits"] = False
             config["router_aux_loss_coef"] = 0.001
 
+    # --- Gemma4 MoE Configuration ---
+    if arch in ("gemma4", "gemma3"):
+        # Gemma4 has MoE with 128 experts, using 8 per token
+        num_experts = get_metadata_int(reader, f"{arch}.expert_count") or 8
+        num_experts_per_tok = get_metadata_int(reader, f"{arch}.expert_used_count") or 2
+        moe_ffn_size = get_metadata_int(reader, f"{arch}.expert_feed_forward_length") or ffn_size
+        
+        config["enable_moe_block"] = True
+        config["num_experts"] = num_experts
+        config["num_experts_per_tok"] = num_experts_per_tok
+        config["top_k_experts"] = num_experts_per_tok
+        config["hidden_size_per_layer_input"] = 0  # Gemma4 doesn't use per-layer input
+        config["layer_types"] = None  # Auto-detected by mlx_lm
+        
+        # Gemma4-specific rope params
+        config["rope_traditional"] = False
+        config["rope_parameters"] = {
+            "sliding_attention": {"factor": 4, "low_freq_factor": 0.5},
+            "full_attention": {"factor": 1, "low_freq_factor": 0},
+        }
+
     return config
 
 
 # ---------------------------------------------------------------------------
 # Tensor name mapping: GGUF → MLX/HuggingFace
 # ---------------------------------------------------------------------------
+
+
+def _map_gemma4_tensor_name(gguf_name: str) -> str:
+    """Map a Gemma4-architecture GGUF tensor name to MLX format.
+    
+    Gemma4 uses MoE (Mixture of Experts) with different tensor naming than Llama.
+    mlx_lm expects specific tensor names for Gemma4.
+    """
+    # Embedding
+    if gguf_name == "token_embd.weight":
+        return "embed_tokens.weight"
+
+    # Output
+    if gguf_name == "output.weight":
+        return "lm_head.weight"
+    if gguf_name == "output_norm.weight":
+        return "norm.weight"
+
+    # Blocks: blk.N.xxx → layers.N.xxx
+    if gguf_name.startswith("blk."):
+        parts = gguf_name.split(".", 2)
+        if len(parts) < 3:
+            return gguf_name
+        layer_idx = parts[1]
+        rest = parts[2]
+
+        # === Gemma4 Attention ===
+        if rest == "attn_q.weight":
+            return f"layers.{layer_idx}.self_attn.q_proj.weight"
+        if rest == "attn_k.weight":
+            return f"layers.{layer_idx}.self_attn.k_proj.weight"
+        if rest == "attn_v.weight":
+            return f"layers.{layer_idx}.self_attn.v_proj.weight"
+        if rest == "attn_output.weight":
+            return f"layers.{layer_idx}.self_attn.o_proj.weight"
+        if rest == "attn_q_norm.weight":
+            return f"layers.{layer_idx}.self_attn.q_norm.weight"
+        if rest == "attn_k_norm.weight":
+            return f"layers.{layer_idx}.self_attn.k_norm.weight"
+
+        # === Gemma4 Layer Norms ===
+        if rest == "attn_norm.weight":
+            return f"layers.{layer_idx}.input_layernorm.weight"
+        if rest == "attn_norm_2.weight":
+            return f"layers.{layer_idx}.input_layernorm.weight"
+        if rest == "post_attention_norm.weight":
+            return f"layers.{layer_idx}.input_layernorm.weight"
+        if rest == "post_attention_norm_1.weight":
+            return f"layers.{layer_idx}.input_layernorm.weight"
+        if rest == "ffn_norm.weight":
+            return f"layers.{layer_idx}.post_attention_layernorm.weight"
+        if rest == "post_ffw_norm.weight":
+            return f"layers.{layer_idx}.post_attention_layernorm.weight"
+        if rest == "post_ffw_norm_1.weight":
+            return f"layers.{layer_idx}.post_feedforward_layernorm_1.weight"
+        if rest == "post_ffw_norm_2.weight":
+            return f"layers.{layer_idx}.post_feedforward_layernorm_2.weight"
+        if rest == "pre_ffw_norm_2.weight":
+            return f"layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
+
+        # === Gemma4 MoE FFN (Standard MLP) ===
+        if rest == "ffn_gate.weight":
+            return f"layers.{layer_idx}.mlp.gate_proj.weight"
+        if rest == "ffn_up.weight":
+            return f"layers.{layer_idx}.mlp.up_proj.weight"
+        if rest == "ffn_down.weight":
+            return f"layers.{layer_idx}.mlp.down_proj.weight"
+
+        # === Gemma4 MoE Router ===
+        # mlx_lm uses router.proj.weight
+        if rest == "ffn_gate_inp.weight":
+            return f"layers.{layer_idx}.router.proj.weight"
+        if rest.startswith("ffn_gate_inp"):
+            return None  # Skip scale tensors
+
+        # === Gemma4 MoE Experts (SwitchGLU) ===
+        # mlx_lm uses experts.switch_glu.gate_proj/up_proj/down_proj
+        if rest == "ffn_gate_up_exps.weight":
+            return f"layers.{layer_idx}.experts.switch_glu.gate_proj.weight"
+        if rest == "ffn_gate_exps.weight":
+            return f"layers.{layer_idx}.experts.switch_glu.gate_proj.weight"
+        if rest == "ffn_up_exps.weight":
+            return f"layers.{layer_idx}.experts.switch_glu.up_proj.weight"
+        if rest == "ffn_down_exps.weight":
+            return f"layers.{layer_idx}.experts.switch_glu.down_proj.weight"
+
+        # === Skip scale factors ===
+        if any(rest.startswith(x) for x in [
+            "ffn_down_exps.scale", "ffn_up_exps.scale", "ffn_gate_exps.scale",
+            "layer_output_scale", "ffn_gate_inp.scale"
+        ]):
+            return None
+
+        # === Rope Frequencies ===
+        if rest == "rope_freqs.weight":
+            return "rope_freqs.weight"
+
+    return gguf_name
 
 
 def _map_llama_tensor_name(gguf_name: str) -> str:
@@ -454,7 +573,13 @@ def _map_llama_tensor_name(gguf_name: str) -> str:
 
 def _map_tensor_name(gguf_name: str, arch: str) -> str:
     """Map a GGUF tensor name to HuggingFace format based on architecture."""
-    # Most architectures follow llama naming for now
+    arch_lower = arch.lower()
+    
+    # Gemma4 has different tensor naming conventions (MoE)
+    if arch_lower in ("gemma4", "gemma3"):
+        return _map_gemma4_tensor_name(gguf_name)
+    
+    # Most other architectures follow llama naming
     return _map_llama_tensor_name(gguf_name)
 
 
@@ -784,6 +909,12 @@ def extract_and_convert_weights(
     for i, tensor in enumerate(reader.tensors):
         gguf_name = tensor.name
         hf_name = _map_tensor_name(gguf_name, arch)
+        
+        # Skip tensors that are not needed for the target format
+        if hf_name is None:
+            skipped += 1
+            continue
+        
         qtype = tensor.tensor_type
         logical_shape = tuple(tensor.shape)
         n_bytes = tensor.n_bytes
