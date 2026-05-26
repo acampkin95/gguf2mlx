@@ -416,6 +416,16 @@ def build_config(reader: GGUFReader, arch: str) -> dict[str, Any]:
         
         # Model type for Gemma4
         config["model_type"] = "gemma4"
+        
+        # Gemma4 uses tied weights (lm_head = token_embd.T)
+        config["tie_word_embeddings"] = True
+    
+    # Create lm_head as transpose of embeddings for tied weights architectures
+    if arch in ("gemma4", "gemma3", "gemma2"):
+        # Gemma models use tied embeddings - lm_head = token_embd.weight.T
+        # mlx_lm will handle the tying at load time, but we need to provide
+        # a lm_head.weight that can be used
+        pass
 
     return config
 
@@ -428,26 +438,24 @@ def build_config(reader: GGUFReader, arch: str) -> dict[str, Any]:
 def _map_gemma4_tensor_name(gguf_name: str) -> str:
     """Map a Gemma4-architecture GGUF tensor name to MLX format.
     
-    Gemma4 uses MoE (Mixture of Experts) with different tensor naming than Llama.
-    mlx_lm's gemma4_text.Model expects weights WITHOUT language_model prefix:
-    - model.layers.X.xxx
-    - model.embed_tokens.weight
-    - lm_head.weight
-    - model.norm.weight
+    mlx_lm Gemma4 Model expects weights with 'language_model.model.' prefix:
+    - language_model.lm_head.weight
+    - language_model.model.embed_tokens.weight
+    - language_model.model.layers.X.xxx
     
-    The outer gemma4.Model.sanitize() will add/remove language_model. prefix.
+    The sanitize function preserves this prefix.
     """
-    # Embedding
+    # Embedding (language_model.model. prefix)
     if gguf_name == "token_embd.weight":
-        return "model.embed_tokens.weight"
+        return "language_model.model.embed_tokens.weight"
 
     # Output
     if gguf_name == "output.weight":
-        return "lm_head.weight"
+        return "language_model.lm_head.weight"
     if gguf_name == "output_norm.weight":
-        return "model.norm.weight"
+        return "language_model.model.norm.weight"
 
-    # Blocks: blk.N.xxx → model.layers.N.xxx
+    # Blocks: blk.N.xxx → language_model.model.layers.N.xxx
     if gguf_name.startswith("blk."):
         parts = gguf_name.split(".", 2)
         if len(parts) < 3:
@@ -457,72 +465,81 @@ def _map_gemma4_tensor_name(gguf_name: str) -> str:
 
         # === Gemma4 Attention ===
         if rest == "attn_q.weight":
-            return f"model.layers.{layer_idx}.self_attn.q_proj.weight"
+            return f"language_model.model.layers.{layer_idx}.self_attn.q_proj.weight"
         if rest == "attn_k.weight":
-            return f"model.layers.{layer_idx}.self_attn.k_proj.weight"
+            return f"language_model.model.layers.{layer_idx}.self_attn.k_proj.weight"
         if rest == "attn_v.weight":
-            return f"model.layers.{layer_idx}.self_attn.v_proj.weight"
+            return f"language_model.model.layers.{layer_idx}.self_attn.v_proj.weight"
         if rest == "attn_output.weight":
-            return f"model.layers.{layer_idx}.self_attn.o_proj.weight"
+            return f"language_model.model.layers.{layer_idx}.self_attn.o_proj.weight"
         if rest == "attn_q_norm.weight":
-            return f"model.layers.{layer_idx}.self_attn.q_norm.weight"
+            return f"language_model.model.layers.{layer_idx}.self_attn.q_norm.weight"
         if rest == "attn_k_norm.weight":
-            return f"model.layers.{layer_idx}.self_attn.k_norm.weight"
+            return f"language_model.model.layers.{layer_idx}.self_attn.k_norm.weight"
 
         # === Gemma4 Layer Norms ===
         if rest == "attn_norm.weight":
-            return f"model.layers.{layer_idx}.input_layernorm.weight"
+            return f"language_model.model.layers.{layer_idx}.input_layernorm.weight"
         if rest == "attn_norm_2.weight":
-            return f"model.layers.{layer_idx}.input_layernorm.weight"
+            return f"language_model.model.layers.{layer_idx}.input_layernorm.weight"
         if rest == "post_attention_norm.weight":
-            return f"model.layers.{layer_idx}.input_layernorm.weight"
+            return f"language_model.model.layers.{layer_idx}.input_layernorm.weight"
         if rest == "post_attention_norm_1.weight":
-            return f"model.layers.{layer_idx}.input_layernorm.weight"
+            return f"language_model.model.layers.{layer_idx}.input_layernorm.weight"
         if rest == "ffn_norm.weight":
-            return f"model.layers.{layer_idx}.post_attention_layernorm.weight"
+            return f"language_model.model.layers.{layer_idx}.post_attention_layernorm.weight"
         if rest == "post_ffw_norm.weight":
-            return f"model.layers.{layer_idx}.post_attention_layernorm.weight"
+            return f"language_model.model.layers.{layer_idx}.post_attention_layernorm.weight"
         if rest == "post_ffw_norm_1.weight":
-            return f"model.layers.{layer_idx}.post_feedforward_layernorm_1.weight"
+            return f"language_model.model.layers.{layer_idx}.post_feedforward_layernorm_1.weight"
         if rest == "post_ffw_norm_2.weight":
-            return f"model.layers.{layer_idx}.post_feedforward_layernorm_2.weight"
+            return f"language_model.model.layers.{layer_idx}.post_feedforward_layernorm_2.weight"
+        if rest == "pre_ffw_norm.weight":
+            return f"language_language.model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
         if rest == "pre_ffw_norm_2.weight":
-            return f"model.layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
+            return f"language_model.model.layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
 
         # === Gemma4 MoE FFN (Standard MLP) ===
         if rest == "ffn_gate.weight":
-            return f"model.layers.{layer_idx}.mlp.gate_proj.weight"
+            return f"language_model.model.layers.{layer_idx}.mlp.gate_proj.weight"
         if rest == "ffn_up.weight":
-            return f"model.layers.{layer_idx}.mlp.up_proj.weight"
+            return f"language_model.model.layers.{layer_idx}.mlp.up_proj.weight"
         if rest == "ffn_down.weight":
-            return f"model.layers.{layer_idx}.mlp.down_proj.weight"
+            return f"language_model.model.layers.{layer_idx}.mlp.down_proj.weight"
 
         # === Gemma4 MoE FFN Layernorms ===
         if rest == "pre_feedforward_layernorm.weight":
-            return f"model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
+            return f"language_model.model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
         if rest == "post_feedforward_layernorm.weight":
-            return f"model.layers.{layer_idx}.post_feedforward_layernorm.weight"
+            return f"language_model.model.layers.{layer_idx}.post_feedforward_layernorm.weight"
+
+        # === Gemma4 MoE Layer Scalar ===
+        if rest == "layer_scalar" or rest.endswith(".layer_scalar"):
+            return f"language_model.model.layers.{layer_idx}.layer_scalar"
+
+        # === Gemma4 MoE Router Scale ===
+        if rest == "router.scale" or rest.endswith(".router.scale"):
+            return f"language_model.model.layers.{layer_idx}.router.scale"
+        if rest == "router.per_expert_scale" or rest.endswith(".router.per_expert_scale"):
+            return f"language_model.model.layers.{layer_idx}.router.per_expert_scale"
 
         # === Gemma4 MoE Router ===
-        # mlx_lm uses router.proj.weight, router.scale, router.per_expert_scale
         if rest == "ffn_gate_inp.weight":
-            return f"model.layers.{layer_idx}.router.proj.weight"
+            return f"language_model.model.layers.{layer_idx}.router.proj.weight"
 
         # === Gemma4 MoE Experts (SwitchGLU) ===
-        # mlx_lm sanitize() expects experts.gate_up_proj/down_proj
-        # (will be split/renamed internally to switch_glu.xxx)
         if rest == "ffn_gate_up_exps.weight":
-            return f"model.layers.{layer_idx}.experts.gate_up_proj.weight"
+            return f"language_model.model.layers.{layer_idx}.experts.gate_up_proj"
         if rest == "ffn_gate_exps.weight":
-            return f"model.layers.{layer_idx}.experts.gate_up_proj.weight"
+            return f"language_model.model.layers.{layer_idx}.experts.gate_up_proj"
         if rest == "ffn_up_exps.weight":
             return None  # Skip - merged into gate_up_proj by mlx_lm sanitize
         if rest == "ffn_down_exps.weight":
-            return f"model.layers.{layer_idx}.experts.down_proj.weight"
+            return f"language_model.model.layers.{layer_idx}.experts.down_proj"
 
         # === Gemma4 Layer Scalar ===
         if rest == "layer_scalar" or rest.endswith(".layer_scalar"):
-            return f"model.layers.{layer_idx}.layer_scalar"
+            return f"language_language.model.layers.{layer_idx}.layer_scalar"
 
         # === Skip scale factors ===
         if any(rest.startswith(x) or rest == x for x in [
@@ -1066,6 +1083,60 @@ def extract_and_convert_weights(
         with safe_open(str(new_path), framework="np") as f:
             for key in f.keys():
                 weight_map[key] = new_name
+
+    # --- Add tied weights for Gemma models ---
+    if arch in ("gemma4", "gemma3", "gemma2"):
+        # Get hidden_size for creating missing parameters
+        hidden_size = get_metadata_int(reader, f"{arch}.embedding_length") or 2816
+        
+        # Gemma models use tied embeddings - lm_head = token_embd.weight.T
+        # This is required by mlx_lm even though weights are tied at runtime
+        # Note: language_model.model. prefix for embed_tokens
+        if "language_model.model.embed_tokens.weight" in weight_map:
+            # Get the shard that contains embed_tokens
+            embed_shard = weight_map["language_model.model.embed_tokens.weight"]
+            embed_path = output_dir / embed_shard
+            
+            # Read embed_tokens and create lm_head
+            with safe_open(str(embed_path), framework="np") as f:
+                embed_weights = f.get_tensor("language_model.model.embed_tokens.weight")
+                lm_head_weights = embed_weights.T.astype(np.float16)
+            
+            # Save lm_head to a new shard
+            lm_head_shard = {"language_model.lm_head.weight": lm_head_weights}
+            new_total = total_shards + 1
+            lm_shard_name = f"model-{new_total:05d}-of-{new_total:05d}.safetensors"
+            save_safetensors(lm_head_shard, str(output_dir / lm_shard_name))
+            
+            # Update weight map
+            weight_map["language_model.lm_head.weight"] = lm_shard_name
+            all_keys.append("language_model.lm_head.weight")
+            total_bytes_out += lm_head_weights.nbytes
+            total_shards = new_total
+            print(f"    ✓ Added tied lm_head.weight from embed_tokens ({lm_head_weights.nbytes / 1e6:.1f} MB)")
+        
+        # Add router scale parameters (initialized to ones, as in mlx_lm)
+        num_experts = get_metadata_int(reader, f"{arch}.expert_count") or 128
+        router_scale_shard: dict[str, np.ndarray] = {}
+        
+        # Create scale tensors for each layer (language_model.model. prefix)
+        num_layers = get_metadata_int(reader, f"{arch}.block_count") or 30
+        for layer_idx in range(num_layers):
+            router_scale_shard[f"language_model.model.layers.{layer_idx}.router.scale"] = np.ones(int(hidden_size), dtype=np.float16)
+            router_scale_shard[f"language_model.model.layers.{layer_idx}.router.per_expert_scale"] = np.ones(num_experts, dtype=np.float16)
+            router_scale_shard[f"language_model.model.layers.{layer_idx}.layer_scalar"] = np.ones(1, dtype=np.float16)
+        
+        if router_scale_shard:
+            new_total = total_shards + 1
+            scale_shard_name = f"model-{new_total:05d}-of-{new_total:05d}.safetensors"
+            save_safetensors(router_scale_shard, str(output_dir / scale_shard_name))
+            
+            for key in router_scale_shard:
+                weight_map[key] = scale_shard_name
+                all_keys.append(key)
+            total_bytes_out += sum(arr.nbytes for arr in router_scale_shard.values())
+            total_shards = new_total
+            print(f"    ✓ Added {len(router_scale_shard)} router scale tensors ({sum(arr.nbytes for arr in router_scale_shard.values()) / 1e6:.1f} MB)")
 
     # --- Save index ---
     index_json = {
